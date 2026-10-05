@@ -110,6 +110,14 @@ def _env_api_key():
     return None
 
 
+def _clean_api_key(api_key):
+    api_key = (api_key or "").strip()
+    if any(char.isspace() for char in api_key) or not api_key.isprintable():
+        # Never echo the key itself in the error message.
+        raise ValueError("FXMacroData API key contains invalid characters")
+    return api_key or None
+
+
 def _dataset_name(dataset):
     normalized = dataset.lower().replace("-", "_")
     return FXMACRODATA_DATASET_ALIASES.get(normalized, normalized)
@@ -204,16 +212,27 @@ class FXMacroDataClient:
     """Small client for the public FXMacroData read/data API surface."""
 
     def __init__(self, api_key=None, base_url=FXMACRODATA_BASE_URL, timeout=30):
-        self.api_key = api_key or _env_api_key()
+        self.api_key = _clean_api_key(api_key or _env_api_key())
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
     def _headers(self, extra=None):
         headers = {"User-Agent": "fxmacrodata-integration"}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
         headers.update(extra or {})
         return headers
+
+    def _send(self, request):
+        if self.api_key:
+            # Unredirected headers are not copied onto a followed redirect, so
+            # the key is never sent to another host.
+            request.add_unredirected_header("X-API-Key", self.api_key)
+        with urlopen(request, timeout=self.timeout) as response:  # nosec B310
+            payload = json.loads(response.read().decode("utf-8"))
+        if isinstance(payload, dict) and "detail" in payload and "data" not in payload:
+            raise ValueError(
+                "FXMacroData returned an error response: %s" % payload["detail"]
+            )
+        return payload
 
     def fetch_dataset(self, dataset, **kwargs):
         dataset = _dataset_name(dataset)
@@ -227,9 +246,7 @@ class FXMacroDataClient:
         url = "%s/%s" % (self.base_url, path.lstrip("/"))
         if query:
             url = "%s?%s" % (url, urlencode(query))
-        request = Request(url, headers=self._headers())
-        with urlopen(request, timeout=self.timeout) as response:  # nosec B310
-            return json.loads(response.read().decode("utf-8"))
+        return self._send(Request(url, headers=self._headers()))
 
     def graphql(self, query, variables=None):
         body = json.dumps({"query": query, "variables": variables or {}}).encode(
@@ -241,8 +258,7 @@ class FXMacroDataClient:
             headers=self._headers({"Content-Type": "application/json"}),
             method="POST",
         )
-        with urlopen(request, timeout=self.timeout) as response:  # nosec B310
-            return json.loads(response.read().decode("utf-8"))
+        return self._send(request)
 
     def to_dataframe(self, payload, limit=None, index=True):
         return _frame_from_payload(payload, limit=limit, index=index)
